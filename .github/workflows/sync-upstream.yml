@@ -1,0 +1,161 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 每 30 分钟检查一次上游。GitHub 的 cron 为 UTC 时间，且不保证准时触发
+    # （高负载时延迟 5-20 分钟属于正常），做不到严格实时。
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制合并（忽略是否已最新）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: 3441293738/creatorhub
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # 防止误在本体仓库运行
+    if: github.repository != '3441293738/creatorhub'
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          if git fetch upstream "${UPSTREAM_BRANCH}" --prune; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::error::拉取上游失败，跳过本次同步"
+          fi
+
+      - name: Check whether already up to date
+        id: check
+        if: steps.fetch.outputs.ok == 'true'
+        run: |
+          UPSTREAM_SHA=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "upstream=$UPSTREAM_SHA"
+          echo "local=$HEAD_SHA"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "已包含上游全部提交，无需同步。"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "检测到上游有新提交，开始合并。"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.fetch.outputs.ok == 'true' && (steps.check.outputs.up_to_date == 'false' || inputs.force == 'true')
+        run: |
+          if git merge "upstream/${UPSTREAM_BRANCH}" --no-edit --allow-unrelated-histories; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+            echo "合并成功（无冲突）"
+          else
+            git merge --abort || true
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::上游改动与本地修改冲突，已回滚，未做任何变更"
+          fi
+
+      - name: Push to fork
+        id: push
+        if: steps.merge.outputs.result == 'clean'
+        run: |
+          if git push origin "HEAD:${TARGET_BRANCH}"; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::推送失败，请检查分支保护规则或工作流权限"
+            exit 1
+          fi
+
+      - name: Report conflict as issue
+        if: steps.merge.outputs.result == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '同步上游冲突：需要手动处理';
+            const body = [
+              '本次自动同步在合并 `${{ env.UPSTREAM_REPO }}` 时出现冲突，已自动回滚，仓库未被修改。',
+              '',
+              '本地命令处理：',
+              '```bash',
+              'git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git  # 若已存在可跳过',
+              'git fetch upstream',
+              'git merge upstream/${{ env.UPSTREAM_BRANCH }}',
+              '# 解决冲突后',
+              'git add -A && git commit && git push origin ${{ env.TARGET_BRANCH }}',
+              '```',
+              '',
+              `触发运行：${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync'
+            });
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['upstream-sync']
+              });
+            }
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 | \`${UPSTREAM_REPO}\` |"
+            echo "| 拉取成功 | ${{ steps.fetch.outputs.ok }} |"
+            echo "| 已是最新 | ${{ steps.check.outputs.up_to_date }} |"
+            echo "| 合并结果 | ${{ steps.merge.outputs.result }} |"
+            echo "| 已推送 | ${{ steps.push.outputs.pushed }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
